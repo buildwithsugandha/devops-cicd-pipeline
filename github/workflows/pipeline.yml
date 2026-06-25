@@ -1,0 +1,179 @@
+name: CI/CD Pipeline — Build, Scan, Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-app
+  EKS_CLUSTER_NAME: devops-cluster
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Stage 1: Lint & Code Quality
+  # ─────────────────────────────────────────────
+  lint:
+    name: Lint & Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run Prettier check
+        run: npm run format:check
+
+  # ─────────────────────────────────────────────
+  # Stage 2: Unit Tests
+  # ─────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Jest tests with coverage
+        run: npm test -- --coverage --ci
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Stage 3: Docker Build & Push to ECR
+  # ─────────────────────────────────────────────
+  build:
+    name: Docker Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────
+  # Stage 4: Trivy Security Scan
+  # Blocks deployment on HIGH/CRITICAL CVEs
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+
+      - name: Upload Trivy scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-scan-results
+          path: trivy-results.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # Stage 5: Deploy to EKS (Rolling Update)
+  # Only runs on push to main after scan passes
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Deploy to EKS — Rolling Update
+        run: |
+          kubectl set image deployment/devops-app \
+            app=${{ needs.build.outputs.image }} \
+            --record
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/devops-app --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          kubectl get pods -l app=devops-app
+          kubectl get deployment devops-app
+
+      # Auto-rollback on failure
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed — initiating rollback..."
+          kubectl rollout undo deployment/devops-app
+          kubectl rollout status deployment/devops-app --timeout=120s
+          echo "Rollback complete."
